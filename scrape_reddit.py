@@ -3,17 +3,24 @@
 Phase 1: Scrape Reddit subreddits via authenticated OAuth API.
 Read-only. Compliant with Reddit Responsible Builder Policy.
 Rate limit: 100 req/min with OAuth (vs ~10 unauthenticated).
+
+Usage:
+    python3 scrape_reddit.py                                   # defaults
+    python3 scrape_reddit.py --subreddits startups,SaaS        # comma-separated
+    python3 scrape_reddit.py -s startups -s SaaS --limit 100   # repeated flags
+    python3 scrape_reddit.py --output data/run-2026-08         # custom output dir
 """
 
 from __future__ import annotations
 
+import argparse
+import base64
 import json
 import os
 import time
-import urllib.request
 import urllib.error
 import urllib.parse
-import base64
+import urllib.request
 from pathlib import Path
 
 # Load .env
@@ -27,21 +34,73 @@ if ENV_FILE.exists():
 
 CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
-USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "lead-magnet-research/1.0")
+USER_AGENT = os.environ.get(
+    "REDDIT_USER_AGENT", "reddit-lead-gen-analytics/1.0 (research script)"
+)
 
-SUBREDDITS = [
-    "SideProject",
+DEFAULT_SUBREDDITS = [
     "Entrepreneur",
-    "WorkOnline",
-    "beermoney",
-    "Automate",
-    "ADHD_Programmers",
-    "selfhosted",
-    "NotionTemplates",
+    "smallbusiness",
+    "SaaS",
+    "freelance",
+    "marketing",
+    "startups",
+    "sidehustle",
+    "indiehackers",
 ]
-TOP_N_POSTS = 50
+DEFAULT_LIMIT = 50
 TOP_N_COMMENTS = 10
-DATA_DIR = Path(__file__).parent / "data" / "raw"
+DEFAULT_OUTPUT_DIR = Path(__file__).parent / "data" / "raw"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments. Defaults reproduce the original hardcoded behavior."""
+    parser = argparse.ArgumentParser(
+        description="Scrape top posts + comments from subreddits into JSON files.",
+    )
+    parser.add_argument(
+        "-s",
+        "--subreddits",
+        action="append",
+        metavar="NAMES",
+        help=(
+            "Subreddit(s) to scrape: comma-separated and/or repeated "
+            "(e.g. -s startups,SaaS -s freelance). "
+            f"Default: {', '.join(DEFAULT_SUBREDDITS)}"
+        ),
+    )
+    parser.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help=f"Max posts to fetch per subreddit (default: {DEFAULT_LIMIT})",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Output directory for <subreddit>.json files (default: data/raw/)",
+    )
+    args = parser.parse_args(argv)
+
+    if args.limit < 1:
+        parser.error("--limit must be >= 1")
+
+    if args.subreddits is None:
+        subs = list(DEFAULT_SUBREDDITS)
+    else:
+        subs = [
+            name.strip().removeprefix("r/")
+            for chunk in args.subreddits
+            for name in chunk.split(",")
+            if name.strip()
+        ]
+    if not subs:
+        parser.error("--subreddits given but no subreddit names could be parsed")
+    args.subreddits = subs
+    return args
 
 
 def get_oauth_token() -> str:
@@ -108,12 +167,13 @@ def fetch_json(url: str, token: str, retries: int = 3) -> dict | list | None:
     return None
 
 
-def get_top_posts(subreddit: str, token: str) -> list[dict]:
+def get_top_posts(subreddit: str, token: str, limit: int = DEFAULT_LIMIT) -> list[dict]:
     """Fetch top posts (past month) via OAuth API."""
     posts = []
     after = None
-    while len(posts) < TOP_N_POSTS:
-        url = f"https://oauth.reddit.com/r/{subreddit}/top?t=month&limit=25"
+    while len(posts) < limit:
+        page_size = min(25, limit - len(posts))
+        url = f"https://oauth.reddit.com/r/{subreddit}/top?t=month&limit={page_size}"
         if after:
             url += f"&after={after}"
         data = fetch_json(url, token)
@@ -123,7 +183,7 @@ def get_top_posts(subreddit: str, token: str) -> list[dict]:
         if not children:
             break
         for child in children:
-            if len(posts) >= TOP_N_POSTS:
+            if len(posts) >= limit:
                 break
             d = child.get("data", {})
             posts.append({
@@ -159,9 +219,9 @@ def get_top_comments(permalink: str, token: str) -> list[str]:
     return comments
 
 
-def scrape_subreddit(subreddit: str, token: str) -> list[dict]:
+def scrape_subreddit(subreddit: str, token: str, limit: int = DEFAULT_LIMIT) -> list[dict]:
     print(f"  Fetching top posts...")
-    posts = get_top_posts(subreddit, token)
+    posts = get_top_posts(subreddit, token, limit)
     print(f"  Got {len(posts)} posts. Fetching comments...")
     for i, post in enumerate(posts):
         post["top_comments"] = get_top_comments(post.get("permalink", ""), token)
@@ -171,12 +231,14 @@ def scrape_subreddit(subreddit: str, token: str) -> list[dict]:
     return posts
 
 
-def main() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    out_dir: Path = args.output
+    out_dir.mkdir(parents=True, exist_ok=True)
     token = get_oauth_token()
 
-    for sub in SUBREDDITS:
-        out_file = DATA_DIR / f"{sub}.json"
+    for sub in args.subreddits:
+        out_file = out_dir / f"{sub}.json"
         if out_file.exists():
             existing = json.loads(out_file.read_text())
             if isinstance(existing, list) and len(existing) > 0:
@@ -184,7 +246,7 @@ def main() -> None:
                 continue
         print(f"Scraping r/{sub}...")
         try:
-            data = scrape_subreddit(sub, token)
+            data = scrape_subreddit(sub, token, args.limit)
             out_file.write_text(json.dumps(data, indent=2))
             print(f"  -> {len(data)} posts saved to {out_file.name}")
         except Exception as e:
